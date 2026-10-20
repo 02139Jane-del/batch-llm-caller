@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM batch caller</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #18243a; background: #f5f7fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 48px 20px; }
+    main { max-width: 720px; margin: 0 auto; }
+    h1 { margin: 0 0 12px; font-size: 2rem; letter-spacing: -0.035em; }
+    h2 { margin: 0 0 20px; font-size: 1.2rem; }
+    p { line-height: 1.6; }
+    .intro { color: #56627a; margin: 0 0 28px; }
+    form, .results { padding: 28px; border: 1px solid #dce2ed; border-radius: 16px; background: #fff; }
+    .field { margin-bottom: 24px; }
+    label { display: block; margin-bottom: 9px; font-weight: 600; }
+    textarea, input { width: 100%; font: inherit; }
+    textarea, input[type="text"] { padding: 12px; color: inherit; background: #fff; border: 1px solid #b9c3d4; border-radius: 8px; }
+    textarea { min-height: 150px; resize: vertical; line-height: 1.5; }
+    input[type="file"] { padding: 10px; border: 1px dashed #b9c3d4; border-radius: 8px; }
+    .hint { margin: 8px 0 0; font-size: 0.85rem; color: #56627a; overflow-wrap: anywhere; }
+    button { padding: 12px 20px; border: 0; border-radius: 8px; background: #2858d6; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+    button:hover { background: #2048b2; }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    :focus-visible { outline: 3px solid #8daaf9; outline-offset: 3px; }
+    #status { margin: 24px 0 12px; line-height: 1.6; overflow-wrap: anywhere; }
+    progress { display: block; width: 100%; height: 8px; margin-bottom: 28px; accent-color: #2858d6; }
+    .results { margin-top: 28px; }
+    .result + .result { margin-top: 24px; padding-top: 24px; border-top: 1px solid #dce2ed; }
+    .result h3 { margin: 0 0 16px; font-size: 0.95rem; }
+    .result h4 { margin: 14px 0 6px; font-size: 0.8rem; color: #56627a; }
+    .result p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .result.error .response { color: #a32b36; }
+    #download { margin-top: 24px; }
+    [hidden] { display: none !important; }
+    @media (max-width: 480px) { body { padding: 28px 16px; } form, .results { padding: 20px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>LLM batch caller</h1>
+    <p class="intro">Send prompts to your local model, one at a time, and export the responses.</p>
+    <form id="batch-form">
+      <div class="field">
+        <label for="system-prompt">System prompt</label>
+        <textarea id="system-prompt" placeholder="You are a helpful assistant."></textarea>
+      </div>
+      <div class="field">
+        <label for="prompt-file">Prompt file</label>
+        <input id="prompt-file" type="file" accept=".txt,.csv" required aria-describedby="file-hint">
+        <p id="file-hint" class="hint">One prompt per line. Blank lines are skipped. Each CSV line is treated as a whole prompt, including any header.</p>
+      </div>
+      <div class="field">
+        <label for="model">Model name</label>
+        <input id="model" type="text" value="qwen3.5-0.8b" required spellcheck="false">
+      </div>
+      <button id="run" type="submit">Run</button>
+      <p class="hint">Start the LM Studio server at http://localhost:1234 and enable CORS in its server settings if your browser blocks requests.</p>
+    </form>
+    <div id="status" role="status" aria-live="polite" aria-atomic="true">Choose a prompt file to get started.</div>
+    <progress id="progress" value="0" max="1" aria-label="Batch progress" hidden></progress>
+    <section id="results-area" class="results" aria-labelledby="results-heading" hidden>
+      <h2 id="results-heading">Results</h2>
+      <div id="results"></div>
+    </section>
+    <button id="download" type="button" hidden>Download CSV</button>
+  </main>
+  <script>
+    'use strict';
+
+    const form = document.getElementById('batch-form');
+    const systemPrompt = document.getElementById('system-prompt');
+    const fileInput = document.getElementById('prompt-file');
+    const modelInput = document.getElementById('model');
+    const runButton = document.getElementById('run');
+    const status = document.getElementById('status');
+    const progress = document.getElementById('progress');
+    const resultsArea = document.getElementById('results-area');
+    const resultsList = document.getElementById('results');
+    const downloadButton = document.getElementById('download');
+    const controls = [systemPrompt, fileInput, modelInput, runButton];
+    let results = [];
+    let running = false;
+
+    function readFile(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Could not read the selected file.'));
+        reader.onabort = () => reject(new Error('File reading was cancelled.'));
+        reader.readAsText(file, 'UTF-8');
+      });
+    }
+
+    function appendResult(result, failed) {
+      const article = document.createElement('article');
+      article.className = failed ? 'result error' : 'result';
+      const heading = document.createElement('h3');
+      heading.textContent = `Row ${result.row_number}${failed ? ' · Failed' : ''}`;
+      article.appendChild(heading);
+      for (const [label, value, className] of [
+        ['Input', result.input, 'input'],
+        ['Response', result.response, 'response']
+      ]) {
+        const title = document.createElement('h4');
+        title.textContent = label;
+        const content = document.createElement('p');
+        content.className = className;
+        content.textContent = value;
+        article.append(title, content);
+      }
+      resultsList.appendChild(article);
+    }
+
+    async function callModel(model, system, input) {
+      const response = await fetch('http://localhost:1234/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: input }
+          ],
+          stream: false
+        })
+      });
+      const body = await response.text();
+      let data;
+      try { data = JSON.parse(body); } catch { /* Include raw text for HTTP errors. */ }
+      if (!response.ok) {
+        const detail = data?.error?.message || body || response.statusText;
+        throw new Error(`HTTP ${response.status}: ${detail}`);
+      }
+      if (data?.error) {
+        throw new Error(data.error.message || 'The API returned an error.');
+      }
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content !== 'string') {
+        throw new Error('The API response did not contain a text completion.');
+      }
+      return content;
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (running) return;
+      const file = fileInput.files[0];
+      const model = modelInput.value.trim();
+      const system = systemPrompt.value;
+      if (!file || !model) {
+        status.textContent = 'Choose a prompt file and enter a model name.';
+        return;
+      }
+      running = true;
+      controls.forEach(control => { control.disabled = true; });
+      results = [];
+      resultsList.replaceChildren();
+      downloadButton.hidden = true;
+      resultsArea.hidden = true;
+      progress.hidden = true;
+      progress.value = 0;
+      status.textContent = 'Reading prompt file…';
+      try {
+        const text = await readFile(file);
+        const prompts = text.replace(/^\uFEFF/, '').split(/\r\n|\n|\r/)
+          .map((input, index) => ({ row_number: index + 1, input }))
+          .filter(row => row.input.trim().length > 0);
+        if (prompts.length === 0) {
+          status.textContent = 'This file has no non-blank prompts. Choose another file.';
+          return;
+        }
+        progress.max = prompts.length;
+        progress.hidden = false;
+        resultsArea.hidden = false;
+        let failures = 0;
+        for (let index = 0; index < prompts.length; index++) {
+          const row = prompts[index];
+          status.textContent = `Processing ${index + 1} of ${prompts.length} (file row ${row.row_number}) · ${index} completed · ${failures} failed`;
+          let response;
+          let failed = false;
+          try {
+            response = await callModel(model, system, row.input);
+          } catch (error) {
+            failed = true;
+            failures++;
+            response = `Error: ${error instanceof Error ? error.message : String(error)}`;
+          }
+          const result = { ...row, response };
+          results.push(result);
+          appendResult(result, failed);
+          progress.value = index + 1;
+          status.textContent = `${index + 1} of ${prompts.length} completed · ${failures} failed`;
+        }
+        status.textContent = `Finished: ${prompts.length} of ${prompts.length} processed · ${prompts.length - failures} succeeded · ${failures} failed. Your CSV is ready.`;
+        downloadButton.hidden = false;
+      } catch (error) {
+        status.textContent = `Error: ${error instanceof Error ? error.message : String(error)}`;
+      } finally {
+        running = false;
+        controls.forEach(control => { control.disabled = false; });
+      }
+    });
+
+    function escapeCSV(value) {
+      const text = String(value);
+      return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+    }
+
+    downloadButton.addEventListener('click', () => {
+      if (running || results.length === 0) return;
+      const rows = [['row_number', 'input', 'response'],
+        ...results.map(result => [result.row_number, result.input, result.response])];
+      const csv = rows.map(row => row.map(escapeCSV).join(',')).join('\r\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'results.csv';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+  </script>
+</body>
+</html>
